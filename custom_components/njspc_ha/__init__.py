@@ -1,13 +1,17 @@
 """The njsPC-HA integration."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
 
+import aiohttp
 import socketio
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform, CONF_HOST, CONF_PORT, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant, Event
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
@@ -46,6 +50,10 @@ from .const import (
     EVENT_VIRTUAL_CIRCUIT,
     EVENT_TEMPS,
     EVENT_SCHEDULE,
+    RECONNECT_INITIAL_DELAY,
+    RECONNECT_MAX_DELAY,
+    RECONNECT_BACKOFF_MULTIPLIER,
+    RECONNECT_JITTER_FACTOR,
 )
 
 
@@ -56,10 +64,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up njsPC-HA from a config entry."""
 
     api = NjsPCHAapi(hass, entry.data)
-    await api.get_initial()
+    try:
+        await api.get_initial()
+    except Exception as err:
+        raise ConfigEntryNotReady(
+            f"Unable to connect to njsPC at {api.get_base_url()}: {err}"
+        ) from err
+
+    if api.config is None:
+        raise ConfigEntryNotReady(
+            f"Unable to retrieve config from njsPC at {api.get_base_url()}"
+        )
 
     coordinator = NjsPCHAdata(hass, api)
-    await coordinator.sio_connect()
+    try:
+        await coordinator.sio_connect()
+    except Exception as err:
+        _LOGGER.warning(
+            "Socket.IO initial connection failed, will retry in background: %s", err
+        )
+        coordinator.start_reconnect_loop()
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
@@ -78,7 +102,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         coordinator = hass.data[DOMAIN].pop(entry.entry_id)
-        hass.async_create_task(coordinator.sio_close())
+        await coordinator.sio_close()
 
     return unload_ok
 
@@ -110,23 +134,12 @@ class NjsPCHAdata(DataUpdateCoordinator):
         if "appVersionState" in api.config:
             self.version = f'{api.config["appVersionState"]["installed"]} ({api.config["appVersionState"]["gitLocalBranch"]}-{api.config["appVersionState"]["gitLocalCommit"][-7:]})'
 
-    async def sio_connect(self):
-        """Method to connect to nodejs-PoolController"""
+        # Reconnection state
+        self._reconnect_task: asyncio.Task | None = None
+        self._unloading: bool = False
 
-        self.sio = socketio.AsyncClient(
-            reconnection=True,
-            reconnection_attempts=0,
-            reconnection_delay=1,
-            reconnection_delay_max=10,
-            logger=False,
-            engineio_logger=False,
-        )
-        # Turn off the incessant logging from the socketio/engineio client the
-        # arguments above do nothing as it doesn't check for false when it
-        # instantiates the SocketIO client.  It just inherits engineio's logger
-        # which defaults to chatty kathy.
-        logging.getLogger("socketio.client").setLevel(logging.ERROR)
-        logging.getLogger("engineio.client").setLevel(logging.ERROR)
+    def _register_sio_handlers(self):
+        """Register Socket.IO event handlers on the current client."""
 
         @self.sio.on("temps")
         async def handle_temps(data):
@@ -208,30 +221,131 @@ class NjsPCHAdata(DataUpdateCoordinator):
 
         @self.sio.event
         async def connect():
-            print("I'm connected!")
+            _LOGGER.info("Socket.IO connected to %s", self.api.get_base_url())
             avail = {"event": EVENT_AVAILABILITY, "available": True}
             self.async_set_updated_data(avail)
-            self.logger.debug(f"SocketIO connect to {self.api.get_base_url()}")
 
         @self.sio.event
         async def connect_error(data):
+            _LOGGER.error("Socket.IO connection error: %s", data)
             avail = {"event": EVENT_AVAILABILITY, "available": False}
             self.async_set_updated_data(avail)
-            self.logger.error(f"SocketIO connection error: {data}")
-            print("The connection failed!")
 
         @self.sio.event
         async def disconnect():
+            _LOGGER.warning(
+                "Socket.IO disconnected from %s", self.api.get_base_url()
+            )
             avail = {"event": EVENT_AVAILABILITY, "available": False}
             self.async_set_updated_data(avail)
-            self.logger.debug(f"SocketIO disconnect to {self.api.get_base_url()}")
-            print("I'm disconnected!")
+            if not self._unloading:
+                self.start_reconnect_loop()
 
+    async def sio_connect(self):
+        """Create a Socket.IO client and connect to njsPC."""
+        self.sio = socketio.AsyncClient(
+            reconnection=False,
+            logger=False,
+            engineio_logger=False,
+        )
+        # Suppress socketio/engineio library logging
+        logging.getLogger("socketio.client").setLevel(logging.ERROR)
+        logging.getLogger("engineio.client").setLevel(logging.ERROR)
+
+        self._register_sio_handlers()
         await self.sio.connect(self.api.get_base_url())
 
+    def start_reconnect_loop(self):
+        """Start the reconnection loop if not already running."""
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            _LOGGER.debug("Reconnect loop already running, not starting another")
+            return
+        if self._unloading:
+            _LOGGER.debug("Unloading in progress, not starting reconnect loop")
+            return
+        _LOGGER.info("Starting reconnection loop to %s", self.api.get_base_url())
+        self._reconnect_task = self.hass.async_create_task(
+            self._reconnect_loop()
+        )
+
+    async def _reconnect_loop(self):
+        """Repeatedly attempt to reconnect with exponential backoff."""
+        delay = RECONNECT_INITIAL_DELAY
+        attempt = 0
+
+        while not self._unloading:
+            attempt += 1
+            jitter = random.uniform(0, RECONNECT_JITTER_FACTOR * delay)
+            actual_delay = delay + jitter
+            _LOGGER.info(
+                "Reconnect attempt %d in %.1f seconds (base delay: %ds)",
+                attempt, actual_delay, delay,
+            )
+
+            try:
+                await asyncio.sleep(actual_delay)
+            except asyncio.CancelledError:
+                _LOGGER.debug("Reconnect loop cancelled during sleep")
+                return
+
+            if self._unloading:
+                return
+
+            try:
+                # Clean up old client
+                await self._safe_disconnect()
+
+                # Re-fetch state via HTTP
+                _LOGGER.debug("Re-fetching state from %s", self.api.get_base_url())
+                await self.api.get_initial()
+                if self.api.config is None:
+                    raise ConnectionError("Failed to fetch config (non-200 response)")
+
+                # Create fresh Socket.IO client and connect
+                await self.sio_connect()
+
+                _LOGGER.info(
+                    "Successfully reconnected to %s on attempt %d",
+                    self.api.get_base_url(), attempt,
+                )
+                return
+
+            except asyncio.CancelledError:
+                _LOGGER.debug("Reconnect loop cancelled during connection attempt")
+                return
+
+            except Exception as err:
+                _LOGGER.warning(
+                    "Reconnect attempt %d failed: %s", attempt, err,
+                )
+                delay = min(delay * RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_MAX_DELAY)
+
+        _LOGGER.debug("Reconnect loop exiting (unloading=%s)", self._unloading)
+
+    async def _safe_disconnect(self):
+        """Safely disconnect the existing Socket.IO client, ignoring errors."""
+        if self.sio is not None:
+            try:
+                if self.sio.connected:
+                    await self.sio.disconnect()
+            except Exception as err:
+                _LOGGER.debug("Error disconnecting old Socket.IO client: %s", err)
+            self.sio = None
+
     async def sio_close(self):
-        """Close the connection to njsPC"""
-        await self.sio.disconnect()
+        """Close the connection to njsPC and stop reconnection."""
+        self._unloading = True
+
+        # Cancel the reconnect loop if running
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except asyncio.CancelledError:
+                pass
+            self._reconnect_task = None
+
+        await self._safe_disconnect()
 
     def send_to_bus(self, data):
         """Send incoming messages to HA event bus"""
@@ -268,14 +382,25 @@ class NjsPCHAapi:
                 _LOGGER.error(await resp.text())
 
     async def get_initial(self):
-        """Let the initial config from nodejs-PoolController"""
-        self._session = aiohttp_client.async_get_clientsession(self.hass)
-        async with self._session.get(f"{self._base_url}/{API_STATE_ALL}") as resp:
-            if resp.status == 200:
-                self.config = await resp.json()
-
-            else:
-                _LOGGER.error(await resp.text())
+        """Get the initial config from nodejs-PoolController."""
+        if self._session is None:
+            self._session = aiohttp_client.async_get_clientsession(self.hass)
+        try:
+            async with self._session.get(
+                f"{self._base_url}/{API_STATE_ALL}"
+            ) as resp:
+                if resp.status == 200:
+                    self.config = await resp.json()
+                else:
+                    error_text = await resp.text()
+                    _LOGGER.error("Error fetching initial config: %s", error_text)
+                    raise ConnectionError(
+                        f"njsPC returned status {resp.status}: {error_text}"
+                    )
+        except aiohttp.ClientError as err:
+            raise ConnectionError(
+                f"Cannot connect to njsPC at {self._base_url}: {err}"
+            ) from err
 
     async def get_heatmodes(self, identifier):
         """Get the available heat modes for body"""
