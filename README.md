@@ -13,7 +13,11 @@ Add the respository URL as a custom [repository integration](https://hacs.xyz/do
 Copy the njspc_ha folder from this repo to config/custom_components (create custom_components folder if it doesn't exist already)
 
 ## Setup
-Once njsPC-HA is installed, you can set it up by adding it as an integration.  The integration should automatically find the instance of nodejs-poolcontroller for you.  It it doesn't, it'll prompt you to enter the IP address and port (default 4200).
+Once njsPC-HA is installed, you can set it up by adding it as an integration.  The integration should automatically find the instance of nodejs-poolcontroller for you.  If it doesn't, it'll prompt you to enter the IP address and port (default 4200).
+
+> **Docker users:** If both Home Assistant and nodejs-poolController run in Docker on the same host, SSDP auto-discovery may find multiple instances — one for each Docker network the njsPC container is attached to. Keep the entry that uses the container's **direct IP on its own bridge network** (e.g. `172.26.0.x`) and delete any duplicates discovered via Docker's default bridge gateway (`172.17.0.1`). The default-bridge entry often produces incomplete device lists. You can find the correct container IP in Portainer under the njsPC stack's network details.
+>
+> When entering the host manually, provide just the IP address (e.g. `192.168.1.100`) — do **not** include `http://`.
 
 
 # Data
